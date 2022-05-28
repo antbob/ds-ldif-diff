@@ -1,0 +1,547 @@
+#!/usr/bin/python3
+
+# --- BEGIN COPYRIGHT BLOCK ---
+# Copyright (C) 2021, 2022 Red Hat, Inc.
+# All rights reserved.
+#
+# License: GPL (version 3 or any later version).
+# See LICENSE for details.
+# --- END COPYRIGHT BLOCK ---
+#
+# PYTHON_ARGCOMPLETE_OK
+
+# This is based on 389ds ds-replcheck tool with replication related logic removed, see
+# https://github.com/389ds/389-ds-base/blob/master/ldap/admin/src/scripts/ds-replcheck
+
+import os
+import sys
+import time
+import signal
+import argparse
+import argcomplete
+from ldif import LDIFRecordList
+from lib389._entry import Entry
+
+
+VERSION = "2.0"
+
+
+def convert_timestamp(timestamp):
+    """Convert createtimestamp to ctime: 20170405184656Z ----> Wed Apr  5 19:46:56 2017
+    :param timestamp - A timestamp from the LDAP server
+    :return - the ctime of the timestamp
+    """
+    time_tuple = (int(timestamp[:4]), int(timestamp[4:6]), int(timestamp[6:8]),
+                  int(timestamp[8:10]), int(timestamp[10:12]), int(timestamp[12:14]),
+                  0, 0, 0)
+    secs = time.mktime(time_tuple)
+    return time.ctime(secs)
+
+
+def format_diff(diff):
+    """Take the diff map and format it for friendly output
+    :param diff - A Dict containing missing/different attribute values
+    :return - a text blog used by the report to display info
+    """
+    diff_report = "%s\n" % (diff['dn'])
+    diff_report += ("-" * len(diff['dn'])) + "\n"
+    for missing in diff['missing']:
+        diff_report += "%s\n" % (missing)
+    for val_diff in diff['diff']:
+        diff_report += "%s\n" % (val_diff)
+
+    return diff_report
+
+
+def add_attr_entry(entry, val, attr):
+    """Add the attr to the entry
+    :param entry - A LDAP entry
+    :param val - The attribute value
+    :param attr - The attribute
+    """
+    if attr is not None:
+        if attr in entry:
+            entry[attr].append(val)
+        else:
+            entry[attr] = [val]
+    val = ""
+
+
+#
+# Helper functions
+#
+def ldif_search(LDIF, dn):
+    """Search ldif for a single DN.  We need to factor in that DN's and
+    attribute values can wrap lines and are identified by a leading white
+    space.  So we can't fully process an attribute until we get to the
+    next attribute.
+    :param LDIF - The LDIF file's File Handle
+    :dn - The DN of the entry to search for
+    :return - An LDAP entry
+    """
+    result = {}
+    data = {}
+    found_part_dn = False
+    found_part_val = False
+    found_attr = False
+    found = False
+    count = 0
+    ignore_list = []
+    val = ""
+    attr = ""
+    part_dn = ""
+    result['entry'] = None
+
+    for line in LDIF:
+        count += 1
+        line = line.rstrip()
+
+        if found:
+            # We found our entry, now build up the entry (account from line wrap)
+            if line == "":
+                # End of entry - update entry's last attribute value and break out
+                add_attr_entry(data, val, attr)
+                val = ""
+                # Done!
+                break
+
+            if line[0] == ' ':
+                # continuation line (wrapped value)
+                val += line[1:]
+                found_part_val = True
+                continue
+            elif found_part_val:
+                # We have the complete value now (it was wrapped)
+                found_part_val = False
+                found_attr = False
+                add_attr_entry(data, val, attr)
+
+                # Now that the value is added to the entry lets process the new attribute...
+                value_set = line.split(":", 1)
+                attr = value_set[0].lower()
+
+                if attr in ignore_list or (attr is None):
+                    # Skip it
+                    found_attr = False
+                    attr = None
+                    continue
+
+                val = value_set[1].strip()
+                found_attr = True
+
+                continue
+            else:
+                # New attribute...
+                if found_attr:
+                    # But first we have to add the previous complete attr value to the entry data
+                    add_attr_entry(data, val, attr)
+
+                # Process new attribute
+                value_set = line.split(":", 1)
+                attr = value_set[0].lower()
+                if attr is None or attr in ignore_list:
+                    # Skip it (its deleted)
+                    found_attr = False
+                    attr = None
+                    continue
+
+                val = value_set[1].strip()
+                found_attr = True
+
+                continue
+
+        elif found_part_dn:
+            if line[0] == ' ':
+                # DN is still wrapping, keep building up the dn value
+                part_dn += line[1:].lower()
+            else:
+                # We now have the full dn
+                found_part_dn = False
+                if part_dn == dn:
+                    # We found our entry
+                    found = True
+
+                    # But now we have a new attribute to process
+                    value_set = line.split(":", 1)
+                    attr = value_set[0].lower()
+                    if attr is None or attr in ignore_list:
+                        # Skip it (its deleted)
+                        found_attr = False
+                        attr = None
+                        continue
+
+                    val = value_set[1].strip()
+                    found_attr = True
+
+                    continue
+
+        if line.startswith('dn: '):
+            if line[4:].lower() == dn:
+                # We got our full DN, now process the entry
+                found = True
+                continue
+            else:
+                # DN wraps the line, keep looping until we get the whole value
+                part_dn = line[4:].lower()
+                found_part_dn = True
+
+    # Keep track of entry index - we use this later when searching the LDIF again
+    result['idx'] = count
+
+    # Sort all the multi-valued attributes
+    for k, v in data.items():
+        v.sort()
+        data[k] = v
+
+    if found:
+        result['entry'] = Entry((dn, data))
+
+    return result
+
+
+def get_dns(LDIF, filename, opts):
+    """Get all the DN's from an LDIF file
+    :param LDIF - The LDIF file File handle
+    :param filename - The LDIF file name
+    :param opts - A Dict of the scripts options
+    :return - List of DN's
+    """
+    dns = []
+    found = False
+    found_ruv = False
+    LDIF.seek(0)
+    for line in LDIF:
+        if line.startswith('dn: '):
+            found = True
+            dn = line[4:].lower().strip()
+            continue
+
+        if found and line[0] == ' ':
+            # continuation line
+            dn += line.lower().strip()
+        elif found and line[0] != ' ':
+            # end of DN - add it to the list
+            found = False
+            dns.append(dn)
+
+    LDIF.seek(0)
+
+    return dns
+
+
+def cmp_entry(sentry, tentry, opts):
+    """Compare the two entries, and return a "diff map"
+    :param sentry - A source entry
+    :param tentry - A target entry
+    :param opts - A Dict of the scripts options
+    :return - A Dict of the differences in the entry, or None
+    """
+    diff = {}
+    diff['dn'] = sentry['dn']
+    diff['missing'] = []
+    diff['diff'] = []
+    diff_count = 0
+
+    tlist = list(tentry.data.keys())
+    slist = list(sentry.data.keys())
+
+    #
+    # Check source
+    #
+    for sattr in slist:
+        if sattr in opts['ignore']:
+            continue
+
+        if sattr not in tlist:
+            # Target is missing the attribute.
+            diff['missing'].append(" - Target missing attribute: \"%s\"" % (sattr))
+            diff_count += 1
+
+        elif sentry.data[sattr] != tentry.data[sattr]:
+            # Target's attr value is different
+            diff['diff'].append(" - Attribute '%s' is different:" % sattr)
+            # report what we got
+            diff['diff'].append("      Source: ")
+            for val in sentry.data[sattr]:
+                diff['diff'].append("        - %s: %s" % (sattr, val))
+            diff['diff'].append("      Target: ")
+            for val in tentry.data[sattr]:
+                diff['diff'].append("        - %s: %s\n" % (sattr, val))
+            diff_count += 1
+
+    #
+    # Check target (only need to check for missing attributes)
+    #
+    for tattr in tlist:
+        if tattr in opts['ignore']:
+            continue
+
+        if tattr not in slist:
+            # Source is missing the attribute
+            diff['missing'].append(" - Source missing attribute: \"%s\"" % (tattr))
+            diff_count += 1
+
+    if diff_count > 0:
+        diff['count'] = str(diff_count)
+        return diff
+    else:
+        return None
+
+
+def do_diff_report(opts, output_file=None):
+    """Check for inconsistencies between two ldifs
+    :param opts - A Dict of the scripts options
+    :param output_file - A file handle to write the report to
+    """
+    missing_report = ""
+    diff_report = []
+    final_report = ""
+
+    # Open LDIF files
+    try:
+        SLDIF = open(opts['sldif'], "r")
+    except Exception as e:
+        print('Failed to open source LDIF: ' + str(e))
+        return
+
+    try:
+        TLDIF = open(opts['tldif'], "r")
+    except Exception as e:
+        print('Failed to open target LDIF: ' + str(e))
+        SLDIF.close()
+        return
+
+    # Verify LDIF Files
+    try:
+        if opts['verbose']:
+            print("Validating source ldif file ({})...".format(opts['sldif']))
+        LDIFRecordList(SLDIF).parse()
+    except ValueError:
+        print('Source LDIF file in invalid, aborting...')
+        SLDIF.close()
+        TLDIF.close()
+        return
+    try:
+        if opts['verbose']:
+            print("Validating target ldif file ({})...".format(opts['tldif']))
+        LDIFRecordList(TLDIF).parse()
+    except ValueError:
+        print('Target LDIF file is invalid, aborting...')
+        SLDIF.close()
+        TLDIF.close()
+        return
+
+    # Get all the dn's, and entry counts
+    if opts['verbose']:
+        print ("Gathering all the DN's...")
+    source_dns = get_dns(SLDIF, opts['sldif'], opts)
+    target_dns = get_dns(TLDIF, opts['tldif'], opts)
+    if source_dns is None or target_dns is None:
+        print("Aborting scan...")
+        SLDIF.close()
+        TLDIF.close()
+        sys.exit(1)
+    s_count = len(source_dns)
+    t_count = len(target_dns)
+
+    """ Compare the source entries with the target's.  Take our list of dn's from
+    the source ldif and get that entry( dn) from the source and target ldif.  In
+    this phase we check for missing entries and entry differences.
+    We only need to do the entry diff checking in this phase - we do not need to
+    do it when we process the target dn's because if the entry exists in both
+    LDIF's then we already checked for diffs while processing the source dn's.
+    """
+    if opts['verbose']:
+        print ("Comparing source to target...")
+    missing = False
+    for dn in source_dns:
+        sresult = ldif_search(SLDIF, dn)
+        if sresult['entry'] is None:
+            # Try from the beginning
+            SLDIF.seek(0)
+            sresult = ldif_search(SLDIF, dn)
+        tresult = ldif_search(TLDIF, dn)
+        if tresult['entry'] is None:
+            # missing entry - restart the search from beginning in case it got skipped
+            TLDIF.seek(0)
+            tresult = ldif_search(TLDIF, dn)
+            if tresult['entry'] is None:
+                # missing entry in target(rentries)
+                TLDIF.seek(sresult['idx'])  # Set the LDIF cursor/index to the last good line
+                if not missing:
+                    missing_report += ('  Entries missing on target:\n')
+                    missing = True
+                if sresult['entry'] and 'createtimestamp' in sresult['entry'].data:
+                    missing_report += ('   - %s  (Created on cource at: %s)\n' %
+                                        (dn, convert_timestamp(sresult['entry'].data['createtimestamp'][0])))
+                else:
+                    missing_report += ('  - %s\n' % dn)
+            else:
+                # Compare the entries
+                diff = cmp_entry(sresult['entry'], tresult['entry'], opts)
+                if diff:
+                    diff_report.append(format_diff(diff))
+        else:
+            # Compare the entries
+            diff = cmp_entry(sresult['entry'], tresult['entry'], opts)
+            if diff:
+                # We have a diff, report the result
+                diff_report.append(format_diff(diff))
+    if missing:
+        missing_report += ('\n')
+
+    """ Search target, and look for missing entries only.  We already did the
+    diff checking, so its only missing entries we are worried about.
+    """
+    if opts['verbose']:
+        print ("Comparing target to source...")
+    SLDIF.seek(0)
+    TLDIF.seek(0)
+    missing = False
+    for dn in target_dns:
+        tresult = ldif_search(TLDIF, dn)
+        sresult = ldif_search(SLDIF, dn)
+        if sresult['entry'] is None:
+            # missing entry
+            SLDIF.seek(0)
+            sresult = ldif_search(SLDIF, dn)
+            if sresult['entry'] is None:
+                SLDIF.seek(tresult['idx'])  # Set the LDIF cursor/index to the last good line
+                if not missing:
+                    missing_report += ('  Entries missing on source:\n')
+                    missing = True
+                if tresult['entry'] and 'createtimestamp' in tresult['entry'].data:
+                    missing_report += ('   - %s  (Created on target at: %s)\n' %
+                                       (dn, convert_timestamp(tresult['entry'].data['createtimestamp'][0])))
+                else:
+                    missing_report += ('  - %s\n' % dn)
+    if missing:
+        missing_report += ('\n')
+
+    SLDIF.close()
+    TLDIF.close()
+
+    if opts['verbose']:
+        print("Preparing report...")
+
+    # Build final report
+    final_report = ('=' * 80 + '\n')
+    final_report += ('         LDIF Differences Report  (%s)\n' %
+                     time.ctime())
+    final_report += ('=' * 80 + '\n\n\n')
+    final_report += ('Entry Counts\n')
+    final_report += ('=====================================================\n\n')
+    final_report += ('Source: %d\n' % (s_count))
+    final_report += ('Target: %d\n\n' % (t_count))
+
+    if missing_report != "":
+        final_report += ('\nMissing Entries\n')
+        final_report += ('=====================================================\n\n')
+        final_report += ('%s\n' % (missing_report))
+    if len(diff_report) > 0:
+        final_report += ('\nEntry Inconsistencies\n')
+        final_report += ('=====================================================\n\n')
+    for diff in diff_report:
+        final_report += ('%s\n' % (diff))
+
+    final_report += ('\nResult\n')
+    final_report += ('=====================================================\n\n')
+    if missing_report == "" and len(diff_report) == 0:
+        final_report += ('No differences between source and target\n')
+    else:
+        final_report += ('There are differences between source and target\n')
+
+    if output_file:
+        output_file.write(final_report)
+    else:
+        print(final_report)
+
+
+def diff_report(args):
+    """Prepare to do a diff report
+    :param args - The argparse args
+    """
+
+    opts = {}
+
+    # Initialize the options
+    opts['verbose'] = args.verbose
+    opts['sldif'] = args.sldif
+    opts['tldif'] = args.tldif
+    
+    opts['ignore'] = []
+    if args.ignore:
+        opts['ignore'] = opts['ignore'] + args.ignore.split(',')
+
+    # Validate LDIF files, must exist and not be empty
+    for ldif_dir in [opts['sldif'], opts['tldif']]:
+        if not os.path.exists(ldif_dir):
+            print ("LDIF file ({}) does not exist".format(ldif_dir))
+            sys.exit(1)
+        if os.path.getsize(ldif_dir) == 0:
+            print ("LDIF file ({}) is empty".format(ldif_dir))
+            sys.exit(1)
+    if opts['sldif'] == opts['tldif']:
+        print("The source and target LDIF files must be different")
+        sys.exit(1)
+
+    OUTPUT_FILE = None
+    if args.file:
+        # Write report to the file
+        try:
+            OUTPUT_FILE = open(args.file, "w")
+        except IOError:
+            print("Can't open file: " + args.file)
+            sys.exit(1)
+
+    if opts['verbose']:
+        print("Performing diff report...")
+    do_diff_report(opts, OUTPUT_FILE)
+
+    # Done, cleanup
+    if OUTPUT_FILE is not None:
+        if opts['verbose']:
+            print('Finished writing report to "%s"' % (args.file))
+        OUTPUT_FILE.close()
+
+
+# handle a control-c gracefully
+def signal_handler(signal, frame):
+    print('\n\nExiting...')
+    sys.exit(0)
+
+
+def main():
+    desc = ("""LDIF Comparison Tool (v""" + VERSION + """).  This script """ +
+            """can be used to compare two LDIF files for differences.""")
+
+    parser = argparse.ArgumentParser(description=desc, allow_abbrev=True)
+    parser.set_defaults(func=diff_report)
+    parser.add_argument('-v', '--verbose', help='Verbose output', action='store_true', default=False, dest='verbose')
+    parser.add_argument('-s', '--source-ldif', help='Source LDIF file',
+                                dest='sldif', default=None, required=True)
+    parser.add_argument('-t', '--target-ldif', help='Target LDIF file',
+                                dest='tldif', default=None, required=True)
+    parser.add_argument('-i', '--ignore', help='Comma separated list of attributes to ignore',
+                                dest='ignore', default=None)
+    parser.add_argument('-o', '--out-file', help='The output file', dest='file', default=None)
+
+    # Process the options
+    argcomplete.autocomplete(parser)
+
+    args = parser.parse_args()
+
+    if not hasattr(args, 'func'):
+        print("No action provided, here is some --help.")
+        parser.print_help()
+        sys.exit(1)
+
+    # Control C handler
+    signal.signal(signal.SIGINT, signal_handler)
+
+    # Do it!
+    args.func(args)
+
+
+if __name__ == '__main__':
+    main()
