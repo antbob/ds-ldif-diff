@@ -1,5 +1,4 @@
 # ds-ldif-diff
-LDIF DIFF
 
 Dependencies: python-ldap, python-lib389
 
